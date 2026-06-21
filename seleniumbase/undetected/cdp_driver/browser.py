@@ -160,6 +160,10 @@ class Browser:
         self._process = None
         self._process_pid = None
         self._keep_user_data_dir = None
+        # The synchronous event loop that drives this browser (if any).
+        # Set by the sync wrappers (CDP Mode) so that stop() can close it,
+        # releasing the loop's selector FD and self-pipe.
+        self._sync_loop = None
         self._is_updating = asyncio.Event()
         self.connection: Connection = None
         logger.debug("Session object initialized: %s" % vars(self))
@@ -1030,6 +1034,13 @@ class Browser:
                     and "I/O operation on closed pipe" in str(exc_value)
                 ):
                     return
+                if (
+                    exc_type is RuntimeError
+                    and "Event loop is closed" in str(exc_value)
+                ):
+                    # Noise from a subprocess pipe's StreamWriter.__del__
+                    # running after the CDP event loop has been closed.
+                    return
                 default_unraisablehook(unraisable)
 
             sys.unraisablehook = silence_pipe_destruction_errors
@@ -1037,6 +1048,41 @@ class Browser:
             atexit.register(
                 lambda: setattr(sys, "unraisablehook", default_unraisablehook)
             )
+        # Free resources to prevent leaks across many CDP sessions:
+        # (1) Clear the subprocess reference so its stdin/stdout/stderr
+        #     pipes can be released once nothing else holds the browser.
+        # (2) Drop the module-global instance reference. Without this, the
+        #     browser (and its connection, websockets, and pipes) would be
+        #     pinned forever, even after the caller drops its references.
+        # (3) Close the attached synchronous event loop (if any), which
+        #     frees the loop's selector FD and self-pipe.
+        # (4) Remove the auto-generated temp profile dir (eg. "uc_*").
+        self._process = None
+        self._process_pid = None
+        with suppress(Exception):
+            get_registered_instances().discard(self)
+        sync_loop = getattr(self, "_sync_loop", None)
+        if sync_loop is not None:
+            with suppress(Exception):
+                if not sync_loop.is_running() and not sync_loop.is_closed():
+                    sync_loop.close()
+        if (
+            not deconstruct
+            and self.config
+            and not self.config.uses_custom_data_dir
+            and self.config.user_data_dir
+            and os.path.exists(self.config.user_data_dir)
+        ):
+            for _ in range(4):
+                try:
+                    shutil.rmtree(
+                        self.config.user_data_dir, ignore_errors=False
+                    )
+                    break
+                except FileNotFoundError:
+                    break
+                except (PermissionError, OSError):
+                    time.sleep(0.1)
 
     def quit(self):
         self.stop()

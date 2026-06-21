@@ -1498,18 +1498,17 @@ def SB(
                     % (c1, left_space, end_text, right_space, cr)
                 )
         if undetectable and hasattr(sb, "_drivers_browser_map"):
-            import asyncio
+            from seleniumbase.core import browser_launcher
             for driver in sb._drivers_browser_map.keys():
                 if (
                     hasattr(driver, "cdp")
                     and driver.cdp
                     and hasattr(driver.cdp, "loop")
                 ):
-                    asyncio.set_event_loop(driver.cdp.loop)
-                    tasks = [tab.aclose() for tab in driver.cdp.get_tabs()]
-                    tasks.append(driver.cdp.driver.connection.aclose())
-                    driver.cdp.loop.run_until_complete(asyncio.gather(*tasks))
-                    driver.cdp.loop.close()
+                    # Release the event loop, DevTools websockets, subprocess
+                    # pipes, registry entry, and temp profile dir. Idempotent,
+                    # so it's a no-op if the wrapped quit() already ran it.
+                    browser_launcher._cdp_teardown(driver)
         gc.collect()
     if test and test_name and not test_passed and raise_test_failure:
         raise exception

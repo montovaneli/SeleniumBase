@@ -2163,12 +2163,22 @@ class CDPMethods():
         self.__slow_mode_pause_if_set()
         self.loop.run_until_complete(self.page.wait(0.2))
 
+    def stop(self):
+        """Stop the browser and release all CDP Mode resources.
+        Closes the DevTools websockets, the synchronous event loop,
+        the subprocess pipes, the module-global instance reference,
+        and removes the temp profile dir. Safe to call more than once."""
+        browser = self.driver
+        if hasattr(browser, "cdp_base"):
+            browser = browser.cdp_base
+        tabs = []
+        with suppress(Exception):
+            tabs = self.get_tabs()
+        cdp_util.stop_loop(self.loop, browser, tabs)
+
     def quit(self):
         """Quit the browser in the Pure CDP Mode Sync format."""
-        driver = self.driver
-        if hasattr(driver, "cdp_base"):
-            driver = driver.cdp_base
-        driver.quit()
+        self.stop()
 
     def _on_a_cf_turnstile_page(self, source=None):
         if not source or len(source) < 400:
@@ -3544,8 +3554,10 @@ class Chrome(CDPMethods):
     def __init__(self, url=None, **kwargs):
         if not url:
             url = "about:blank"
-        driver = cdp_util.start_sync(**kwargs)
+        # Use a single event loop for both starting and driving the browser.
+        # (Creating a second loop here would leak the first one's FDs.)
         loop = asyncio.new_event_loop()
+        driver = cdp_util.start_sync(loop=loop, **kwargs)
         page = loop.run_until_complete(driver.get(url))
         wait_timeout = 30.0
         if hasattr(sb_config, "_cdp_proxy") and sb_config._cdp_proxy:
