@@ -634,6 +634,26 @@ def uc_open_with_reconnect(driver, url, reconnect_time=None):
     return None
 
 
+def _cdp_teardown(driver):
+    """Release CDP Mode resources held by a SeleniumBase driver.
+    Closes the synchronous event loop, the DevTools websockets, the
+    subprocess pipes, the module-global instance reference, and removes
+    the temp profile dir. Idempotent: safe to call more than once (eg.
+    from a wrapped quit() and again from the SB() context teardown)."""
+    from seleniumbase.undetected.cdp_driver import cdp_util
+
+    cdp = getattr(driver, "cdp", None)
+    loop = getattr(cdp, "loop", None) if cdp else None
+    browser = getattr(driver, "cdp_base", None)
+    if browser is None and cdp is not None:
+        browser = getattr(cdp, "driver", None)
+    tabs = []
+    if cdp is not None:
+        with suppress(Exception):
+            tabs = cdp.get_tabs()
+    cdp_util.stop_loop(loop, browser, tabs)
+
+
 def uc_open_with_cdp_mode(driver, url=None, **kwargs):
     """Activate CDP Mode with the URL and kwargs."""
     import asyncio
@@ -982,6 +1002,23 @@ def uc_open_with_cdp_mode(driver, url=None, **kwargs):
     driver.find_element_by_text = CDPM.find_element_by_text
     driver.flash = CDPM.flash
     driver._is_using_cdp = True
+    # Remember the loop so Browser.stop() can close it, and wrap quit()/stop()
+    # so all CDP resources (event loop, websockets, subprocess pipes, temp
+    # profile dir, and registry entry) are released when the driver is quit —
+    # not only when using the "with SB()" context manager.
+    with suppress(Exception):
+        driver.cdp_base._sync_loop = loop
+    if not getattr(driver, "_cdp_quit_wrapped", False):
+        _sb_original_quit = driver.quit
+
+        def _cdp_aware_quit():
+            with suppress(Exception):
+                _cdp_teardown(driver)
+            return _sb_original_quit()
+
+        driver.quit = _cdp_aware_quit
+        driver.stop = _cdp_aware_quit
+        driver._cdp_quit_wrapped = True
     if (
         getattr(sb_config, "_cdp_proxy", None)
         and "@" in sb_config._cdp_proxy

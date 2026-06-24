@@ -764,16 +764,50 @@ async def start_async(*args, **kwargs) -> Browser:
 
 
 def start_sync(*args, **kwargs) -> Browser:
-    loop = None
-    if (
-        "loop" in kwargs
-        and kwargs["loop"]
-        and hasattr(kwargs["loop"], "create_task")
-    ):
-        loop = kwargs["loop"]
-    else:
+    # Pop "loop" so callers can reuse a single event loop for both starting
+    # the browser and driving it afterwards. (Avoids creating a second loop
+    # that would never be closed.) Also keeps "loop" out of the Config.
+    loop = kwargs.pop("loop", None)
+    if not (loop and hasattr(loop, "create_task")):
         loop = asyncio.new_event_loop()
-    return loop.run_until_complete(start(*args, **kwargs))
+    browser = loop.run_until_complete(start(*args, **kwargs))
+    # Remember the loop on the browser so Browser.stop() can close it,
+    # releasing the loop's selector FD and self-pipe.
+    with suppress(Exception):
+        browser._sync_loop = loop
+    return browser
+
+
+def stop_loop(loop=None, browser=None, tabs=None):
+    """Idempotently release the resources used by a CDP Mode session.
+
+    Closes the DevTools websockets (browser + tabs), stops the browser
+    process, and closes the synchronous event loop. This frees the
+    websocket sockets, the subprocess pipes, the loop's selector FD and
+    self-pipe, the module-global instance reference, and the temp profile
+    dir (the latter three are handled inside ``Browser.stop()``).
+    Safe to call more than once (later calls are no-ops).
+    """
+    if loop is not None and not loop.is_closed():
+        with suppress(Exception):
+            asyncio.set_event_loop(loop)
+            close_tasks = []
+            for _tab in (tabs or []):
+                with suppress(Exception):
+                    close_tasks.append(_tab.aclose())
+            if browser is not None and getattr(browser, "connection", None):
+                with suppress(Exception):
+                    close_tasks.append(browser.connection.aclose())
+            if close_tasks:
+                loop.run_until_complete(
+                    asyncio.gather(*close_tasks, return_exceptions=True)
+                )
+    if browser is not None:
+        with suppress(Exception):
+            browser.stop()
+    if loop is not None and not loop.is_closed():
+        with suppress(Exception):
+            loop.close()
 
 
 async def create_from_driver(driver) -> Browser:

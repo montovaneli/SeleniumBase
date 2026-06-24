@@ -37,8 +37,70 @@ def get_registered_instances():
     return __registered__instances__
 
 
+def _procs_using_data_dir(data_dir):
+    """Return the psutil.Process objects whose command line launched Chrome
+    with ``--user-data-dir=<data_dir>``.
+
+    This finds the real Chrome process even when the SeleniumBase instance
+    being quit doesn't own it: when the first DevTools connect times out,
+    ``Browser.create`` retries, and because ``start()`` has already set
+    ``config.port``, the retry takes the ``connect_existing`` path and
+    *reconnects* to the first attempt's Chrome rather than spawning a new
+    one. The returned/driving instance then has ``_process is None`` while a
+    different (registered) instance owns the process -- so keying cleanup off
+    ``self._process_pid`` alone misses it, and the temp dir leaks.
+    """
+    found = []
+    if not data_dir:
+        return found
+    target = os.path.normpath(data_dir)
+    for proc in psutil.process_iter(["cmdline"]):
+        try:
+            for part in (proc.info["cmdline"] or []):
+                if part.startswith("--user-data-dir="):
+                    if os.path.normpath(part.split("=", 1)[1]) == target:
+                        found.append(proc)
+                    break
+        except Exception:
+            pass
+    return found
+
+
+def _wait_for_processes_exit(procs, timeout=12.0):
+    """Terminate (if still running) every process in ``procs`` (a list of
+    psutil.Process objects) and block until they have fully exited,
+    force-killing any stragglers.
+
+    Why this matters for temp-dir cleanup: On POSIX, ``terminate()`` sends
+    ``SIGTERM``, and Chrome rewrites files in its user-data-dir (eg. "Last
+    Session", "Last Tabs", the lock files, etc.) while it shuts down
+    gracefully. If the profile dir is removed before that finishes, Chrome
+    recreates it, and the temp dir is leaked. (On Windows, ``terminate()``
+    is a hard ``TerminateProcess``, so the dir is already free -- which is
+    why the leak only reproduces on macOS/Linux.) Blocking here until the
+    whole process tree is gone makes the subsequent ``rmtree`` stick.
+    """
+    if not procs:
+        return
+    with suppress(Exception):
+        for p in procs:
+            with suppress(Exception):
+                if p.is_running():
+                    p.terminate()
+        gone, alive = psutil.wait_procs(procs, timeout=timeout)
+        for p in alive:
+            with suppress(Exception):
+                p.kill()
+        if alive:
+            with suppress(Exception):
+                psutil.wait_procs(alive, timeout=3.0)
+
+
 def deconstruct_browser():
-    for _ in __registered__instances__:
+    # Iterate over a snapshot: stop() removes the instance from the live
+    # registry (get_registered_instances().discard), which would otherwise
+    # raise "Set changed size during iteration" here.
+    for _ in list(__registered__instances__):
         if not _.stopped:
             _.stop(deconstruct=True)
         max_attempts = 5
@@ -160,6 +222,10 @@ class Browser:
         self._process = None
         self._process_pid = None
         self._keep_user_data_dir = None
+        # The synchronous event loop that drives this browser (if any).
+        # Set by the sync wrappers (CDP Mode) so that stop() can close it,
+        # releasing the loop's selector FD and self-pipe.
+        self._sync_loop = None
         self._is_updating = asyncio.Event()
         self.connection: Connection = None
         logger.debug("Session object initialized: %s" % vars(self))
@@ -923,6 +989,37 @@ class Browser:
         connection_id = None
         with suppress(Exception):
             connection_id = self.connection.websocket.id.hex
+        # Capture the full Chrome process tree now, before terminating it.
+        # Children get reparented (away from this pid) once the parent dies
+        # on POSIX, so they must be grabbed first to be waited on later. The
+        # profile dir is only removed after all of these have exited (so
+        # Chrome can't recreate it mid-shutdown -- see cleanup below).
+        proc_tree = []
+        _seen_pids = set()
+        with suppress(Exception):
+            if self._process_pid:
+                _root = psutil.Process(self._process_pid)
+                proc_tree = [_root] + _root.children(recursive=True)
+                _seen_pids = {p.pid for p in proc_tree}
+        # Also find Chrome by its --user-data-dir. When a connect_existing
+        # retry reconnected to another instance's Chrome, this instance owns
+        # no process (self._process_pid is None), so the line above finds
+        # nothing -- but that Chrome is still alive and would recreate the
+        # profile dir after the rmtree below. (See _procs_using_data_dir.)
+        if not deconstruct and self.config:
+            with suppress(Exception):
+                ddir = self.config.user_data_dir
+                if ddir and not self.config.uses_custom_data_dir:
+                    for _p in _procs_using_data_dir(ddir):
+                        if _p.pid in _seen_pids:
+                            continue
+                        _seen_pids.add(_p.pid)
+                        proc_tree.append(_p)
+                        with suppress(Exception):
+                            for _c in _p.children(recursive=True):
+                                if _c.pid not in _seen_pids:
+                                    _seen_pids.add(_c.pid)
+                                    proc_tree.append(_c)
         close_success = False
         try:
             if self.connection:
@@ -1030,6 +1127,13 @@ class Browser:
                     and "I/O operation on closed pipe" in str(exc_value)
                 ):
                     return
+                if (
+                    exc_type is RuntimeError
+                    and "Event loop is closed" in str(exc_value)
+                ):
+                    # Noise from a subprocess pipe's StreamWriter.__del__
+                    # running after the CDP event loop has been closed.
+                    return
                 default_unraisablehook(unraisable)
 
             sys.unraisablehook = silence_pipe_destruction_errors
@@ -1037,6 +1141,47 @@ class Browser:
             atexit.register(
                 lambda: setattr(sys, "unraisablehook", default_unraisablehook)
             )
+        # Free resources to prevent leaks across many CDP sessions:
+        # (1) Wait for the whole Chrome process tree to fully exit. This
+        #     must happen BEFORE removing the profile dir: on POSIX, Chrome
+        #     rewrites its user-data-dir during the graceful SIGTERM
+        #     shutdown, so deleting it too early lets Chrome recreate it and
+        #     leak the temp dir. (See _wait_for_processes_exit for details.)
+        # (2) Clear the subprocess reference so its stdin/stdout/stderr
+        #     pipes can be released once nothing else holds the browser.
+        # (3) Drop the module-global instance reference. Without this, the
+        #     browser (and its connection, websockets, and pipes) would be
+        #     pinned forever, even after the caller drops its references.
+        # (4) Close the attached synchronous event loop (if any), which
+        #     frees the loop's selector FD and self-pipe.
+        # (5) Remove the auto-generated temp profile dir (eg. "uc_*").
+        _wait_for_processes_exit(proc_tree)
+        self._process = None
+        self._process_pid = None
+        with suppress(Exception):
+            get_registered_instances().discard(self)
+        sync_loop = getattr(self, "_sync_loop", None)
+        if sync_loop is not None:
+            with suppress(Exception):
+                if not sync_loop.is_running() and not sync_loop.is_closed():
+                    sync_loop.close()
+        if (
+            not deconstruct
+            and self.config
+            and not self.config.uses_custom_data_dir
+            and self.config.user_data_dir
+            and os.path.exists(self.config.user_data_dir)
+        ):
+            for _ in range(8):
+                try:
+                    shutil.rmtree(
+                        self.config.user_data_dir, ignore_errors=False
+                    )
+                    break
+                except FileNotFoundError:
+                    break
+                except (PermissionError, OSError):
+                    time.sleep(0.15)
 
     def quit(self):
         self.stop()
