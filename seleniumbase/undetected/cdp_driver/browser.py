@@ -37,13 +37,43 @@ def get_registered_instances():
     return __registered__instances__
 
 
-def _wait_for_processes_exit(procs, timeout=12.0):
-    """Block until every process in ``procs`` (a list of psutil.Process
-    objects) has fully exited, force-killing any stragglers.
+def _procs_using_data_dir(data_dir):
+    """Return the psutil.Process objects whose command line launched Chrome
+    with ``--user-data-dir=<data_dir>``.
 
-    Why this matters for temp-dir cleanup: On POSIX, ``Popen.terminate()``
-    sends ``SIGTERM``, and Chrome rewrites files in its user-data-dir (eg.
-    "Last Session", "Last Tabs", the lock files, etc.) while it shuts down
+    This finds the real Chrome process even when the SeleniumBase instance
+    being quit doesn't own it: when the first DevTools connect times out,
+    ``Browser.create`` retries, and because ``start()`` has already set
+    ``config.port``, the retry takes the ``connect_existing`` path and
+    *reconnects* to the first attempt's Chrome rather than spawning a new
+    one. The returned/driving instance then has ``_process is None`` while a
+    different (registered) instance owns the process -- so keying cleanup off
+    ``self._process_pid`` alone misses it, and the temp dir leaks.
+    """
+    found = []
+    if not data_dir:
+        return found
+    target = os.path.normpath(data_dir)
+    for proc in psutil.process_iter(["cmdline"]):
+        try:
+            for part in (proc.info["cmdline"] or []):
+                if part.startswith("--user-data-dir="):
+                    if os.path.normpath(part.split("=", 1)[1]) == target:
+                        found.append(proc)
+                    break
+        except Exception:
+            pass
+    return found
+
+
+def _wait_for_processes_exit(procs, timeout=12.0):
+    """Terminate (if still running) every process in ``procs`` (a list of
+    psutil.Process objects) and block until they have fully exited,
+    force-killing any stragglers.
+
+    Why this matters for temp-dir cleanup: On POSIX, ``terminate()`` sends
+    ``SIGTERM``, and Chrome rewrites files in its user-data-dir (eg. "Last
+    Session", "Last Tabs", the lock files, etc.) while it shuts down
     gracefully. If the profile dir is removed before that finishes, Chrome
     recreates it, and the temp dir is leaked. (On Windows, ``terminate()``
     is a hard ``TerminateProcess``, so the dir is already free -- which is
@@ -53,6 +83,10 @@ def _wait_for_processes_exit(procs, timeout=12.0):
     if not procs:
         return
     with suppress(Exception):
+        for p in procs:
+            with suppress(Exception):
+                if p.is_running():
+                    p.terminate()
         gone, alive = psutil.wait_procs(procs, timeout=timeout)
         for p in alive:
             with suppress(Exception):
@@ -961,10 +995,31 @@ class Browser:
         # profile dir is only removed after all of these have exited (so
         # Chrome can't recreate it mid-shutdown -- see cleanup below).
         proc_tree = []
+        _seen_pids = set()
         with suppress(Exception):
             if self._process_pid:
                 _root = psutil.Process(self._process_pid)
                 proc_tree = [_root] + _root.children(recursive=True)
+                _seen_pids = {p.pid for p in proc_tree}
+        # Also find Chrome by its --user-data-dir. When a connect_existing
+        # retry reconnected to another instance's Chrome, this instance owns
+        # no process (self._process_pid is None), so the line above finds
+        # nothing -- but that Chrome is still alive and would recreate the
+        # profile dir after the rmtree below. (See _procs_using_data_dir.)
+        if not deconstruct and self.config:
+            with suppress(Exception):
+                ddir = self.config.user_data_dir
+                if ddir and not self.config.uses_custom_data_dir:
+                    for _p in _procs_using_data_dir(ddir):
+                        if _p.pid in _seen_pids:
+                            continue
+                        _seen_pids.add(_p.pid)
+                        proc_tree.append(_p)
+                        with suppress(Exception):
+                            for _c in _p.children(recursive=True):
+                                if _c.pid not in _seen_pids:
+                                    _seen_pids.add(_c.pid)
+                                    proc_tree.append(_c)
         close_success = False
         try:
             if self.connection:
